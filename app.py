@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -42,8 +43,33 @@ if TESSDATA:
 
 import pymupdf  # noqa: E402  (må importeres etter at TESSDATA_PREFIX er satt)
 import pymupdf4llm  # noqa: E402
+import pymupdf4llm.helpers.document_layout as _layout  # noqa: E402
 
 PORT = 8765
+
+# Fremdrift: pymupdf4llm går gjennom sidene med en tekstbasert fremdriftsteller.
+# Vi bytter den ut med en som melder hver side til jobben som kjører i samme tråd.
+_progress = threading.local()
+
+
+class _PageProgress:
+    def __init__(self, items):
+        self._items = list(items)
+        # Bare første gjennomgang (sidetolkingen) tar tid; den neste er tekstgenereringen
+        self._report = getattr(_progress, "report", None)
+        _progress.report = None
+
+    def __iter__(self):
+        total = len(self._items)
+        for i, item in enumerate(self._items):
+            if self._report:
+                self._report(i, total)
+            yield item
+        if self._report:
+            self._report(total, total)
+
+
+_layout.ProgressBar = _PageProgress
 # .app-en kan ikke skrive inni seg selv, så den lagrer i Dokumenter
 OUT_DIR = Path.home() / "Documents" / APP_NAME if FROZEN else HERE / "Markdown"
 
@@ -63,16 +89,53 @@ def unique_path(stem: str) -> Path:
     return path
 
 
-def convert(pdf_bytes: bytes, force_ocr: bool = False) -> str:
-    # OCR kjøres automatisk på sider uten tekstlag; force_ocr tolker alle sider på nytt
-    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-        return pymupdf4llm.to_markdown(
-            doc,
-            show_progress=False,
-            ocr_language="nor+eng",
-            ocr_dpi=300,
-            force_ocr=force_ocr,
-        )
+def convert(pdf_bytes: bytes, force_ocr: bool = False, on_page=None) -> str:
+    # OCR kjøres automatisk på sider uten tekstlag; force_ocr tolker alle sider på nytt.
+    # on_page(ferdige, totalt) kalles per side for dokumenter på fem sider eller mer.
+    _progress.report = on_page
+    try:
+        with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+            return pymupdf4llm.to_markdown(
+                doc,
+                show_progress=on_page is not None,
+                ocr_language="nor+eng",
+                ocr_dpi=300,
+                force_ocr=force_ocr,
+            )
+    finally:
+        _progress.report = None
+
+
+class Job:
+    def __init__(self, name: str, pdf_bytes: bytes, force_ocr: bool):
+        self.id = uuid.uuid4().hex
+        self.name, self.pdf_bytes, self.force_ocr = name, pdf_bytes, force_ocr
+        self.done, self.pages = 0, 0
+        self.finished = False
+        self.result = {}
+
+    def run(self):
+        try:
+            with pymupdf.open(stream=self.pdf_bytes, filetype="pdf") as doc:
+                self.pages = doc.page_count
+            md = convert(self.pdf_bytes, self.force_ocr, self._on_page)
+            OUT_DIR.mkdir(parents=True, exist_ok=True)
+            out = unique_path(safe_stem(self.name))
+            out.write_text(md, encoding="utf-8")
+            self.result = {"file": out.name, "markdown": md}
+        except Exception as e:
+            self.result = {"error": f"Klarte ikke å lese PDF-en: {e}"}
+        self.pdf_bytes = b""
+        self.finished = True
+
+    def _on_page(self, done, total):
+        self.done, self.pages = done, total
+
+    def status(self):
+        return {"done": self.done, "pages": self.pages, "finished": self.finished, **self.result}
+
+
+JOBS = {}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -91,9 +154,18 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(int(self.headers.get("Content-Length", 0)))
 
     def do_GET(self):
-        if urlparse(self.path).path == "/":
+        url = urlparse(self.path)
+        if url.path == "/":
             page = PAGE.replace("{{OUT_DIR}}", str(OUT_DIR).replace(str(Path.home()), "~"))
             self._send(200, page, "text/html; charset=utf-8")
+        elif url.path == "/status":
+            job = JOBS.get(parse_qs(url.query).get("id", [""])[0])
+            if not job:
+                return self._send(404, json.dumps({"error": "Ukjent jobb"}))
+            status = job.status()
+            if job.finished:
+                JOBS.pop(job.id, None)
+            self._send(200, json.dumps(status, ensure_ascii=False))
         else:
             self._send(404, "{}")
 
@@ -112,15 +184,11 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(url.query)
         name = unquote(query.get("name", ["dokument.pdf"])[0])
         force_ocr = query.get("ocr", ["0"])[0] == "1"
-        pdf_bytes = self._body()
-        try:
-            md = convert(pdf_bytes, force_ocr)
-        except Exception as e:
-            return self._send(400, json.dumps({"error": f"Klarte ikke å lese PDF-en: {e}"}))
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        out = unique_path(safe_stem(name))
-        out.write_text(md, encoding="utf-8")
-        self._send(200, json.dumps({"file": out.name, "markdown": md}, ensure_ascii=False))
+        # Konverteringen går i bakgrunnen; nettsiden henter fremdrift fra /status
+        job = Job(name, self._body(), force_ocr)
+        JOBS[job.id] = job
+        threading.Thread(target=job.run, daemon=True).start()
+        self._send(200, json.dumps({"id": job.id}))
 
 
 PAGE = r"""<!doctype html>
@@ -153,6 +221,10 @@ PAGE = r"""<!doctype html>
   .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .status { font-size: 13px; color: var(--muted); }
   .status.ok { color: var(--ok); } .status.err { color: var(--err); }
+  .progress { height: 4px; margin: 0 14px 12px; border-radius: 2px; background: var(--line); overflow: hidden; }
+  .progress .fill { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .progress.busy .fill { width: 30%; animation: slide 1.2s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
   pre { margin:0; padding: 14px; border-top: 1px solid var(--line); max-height: 420px; overflow:auto; white-space: pre-wrap; word-break: break-word; font: 13px/1.5 ui-monospace, Menlo, monospace; display:none; }
   li.open pre { display:block; }
 </style>
@@ -183,30 +255,59 @@ pick.onchange = () => { handle(pick.files); pick.value = ''; };
 drop.addEventListener('drop', ev => handle(ev.dataTransfer.files));
 document.getElementById('folder').onclick = () => fetch('/open-folder', {method:'POST'});
 
-async function handle(files) {
+// Filene konverteres én om gangen, så fremdriften for hver fil gir mening
+let queue = Promise.resolve();
+function handle(files) {
+  let prev = null;  // nye filer øverst, men i samme rekkefølge som de ble sluppet
   for (const f of files) {
     if (!f.name.toLowerCase().endsWith('.pdf')) continue;
     const li = document.createElement('li');
-    li.innerHTML = '<div class="row"><span class="name"></span><span class="status">Konverterer …</span></div><pre></pre>';
+    li.innerHTML = '<div class="row"><span class="name"></span><span class="status">I kø</span></div><div class="progress"><div class="fill"></div></div><pre></pre>';
     li.querySelector('.name').textContent = f.name;
-    list.prepend(li);
-    const status = li.querySelector('.status');
-    try {
-      const ocr = document.getElementById('force').checked ? '1' : '0';
-      const res = await fetch('/convert?ocr=' + ocr + '&name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      status.textContent = 'Lagret som ' + data.file;
-      status.className = 'status ok';
-      li.querySelector('pre').textContent = data.markdown;
-      const row = li.querySelector('.row');
-      const show = btn('Vis', () => { li.classList.toggle('open'); show.textContent = li.classList.contains('open') ? 'Skjul' : 'Vis'; });
-      const copy = btn('Kopier', async () => { await fetch('/copy', { method: 'POST', body: data.markdown }); copy.textContent = 'Kopiert'; setTimeout(() => copy.textContent = 'Kopier', 1500); });
-      row.append(show, copy);
-    } catch (e) {
-      status.textContent = e.message || 'Noe gikk galt';
-      status.className = 'status err';
+    prev ? prev.after(li) : list.prepend(li);
+    prev = li;
+    const ocr = document.getElementById('force').checked ? '1' : '0';
+    queue = queue.then(() => convert(f, li, ocr));
+  }
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function convert(f, li, ocr) {
+  const status = li.querySelector('.status'), bar = li.querySelector('.progress'), fill = bar.querySelector('.fill');
+  status.textContent = 'Starter …';
+  bar.classList.add('busy');
+  try {
+    const res = await fetch('/convert?ocr=' + ocr + '&name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
+    const { id } = await res.json();
+    let data;
+    while (true) {
+      await sleep(300);
+      data = await (await fetch('/status?id=' + id)).json();
+      if (data.finished) break;
+      // Dokumenter under fem sider melder ikke fremdrift; da vises en løpende stripe
+      if (data.done > 0) {
+        const pct = Math.round(100 * data.done / data.pages);
+        bar.classList.remove('busy');
+        fill.style.width = pct + '%';
+        status.textContent = pct + ' % · side ' + data.done + ' av ' + data.pages;
+      } else {
+        status.textContent = data.pages ? 'Konverterer ' + data.pages + (data.pages === 1 ? ' side …' : ' sider …') : 'Konverterer …';
+      }
     }
+    if (data.error) throw new Error(data.error);
+    status.textContent = 'Lagret som ' + data.file;
+    status.className = 'status ok';
+    li.querySelector('pre').textContent = data.markdown;
+    const row = li.querySelector('.row');
+    const show = btn('Vis', () => { li.classList.toggle('open'); show.textContent = li.classList.contains('open') ? 'Skjul' : 'Vis'; });
+    const copy = btn('Kopier', async () => { await fetch('/copy', { method: 'POST', body: data.markdown }); copy.textContent = 'Kopiert'; setTimeout(() => copy.textContent = 'Kopier', 1500); });
+    row.append(show, copy);
+  } catch (e) {
+    status.textContent = e.message || 'Noe gikk galt';
+    status.className = 'status err';
+  } finally {
+    bar.remove();
   }
 }
 function btn(label, fn) { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; return b; }
