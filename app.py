@@ -106,6 +106,41 @@ def convert(pdf_bytes: bytes, force_ocr: bool = False, on_page=None) -> str:
         _progress.report = None
 
 
+SETTINGS = Path.home() / "Library" / "Application Support" / APP_NAME / "settings.json"
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_setting(key, value):
+    settings = load_settings()
+    settings[key] = value
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(settings), encoding="utf-8")
+
+
+def ui_language() -> str:
+    # Eget valg fra språkvelgeren går foran språket macOS står på
+    saved = load_settings().get("lang")
+    return saved if saved in ("nb", "en") else system_language()
+
+
+def system_language() -> str:
+    """Første foretrukne språk i macOS: «nb» for norsk, ellers «en»."""
+    try:
+        out = subprocess.run(["defaults", "read", "-g", "AppleLanguages"],
+                             capture_output=True, text=True, timeout=2).stdout
+        # Utdata ser ut som ( "nb-NO", "en-US" ) – noen ganger uten anførselstegn
+        first = re.search(r'\(\s*"?([A-Za-z]{2,3})', out).group(1).lower()
+    except Exception:
+        first = (os.environ.get("LANG") or "en")[:2].lower()
+    return "nb" if first in ("nb", "no", "nn") else "en"
+
+
 class Job:
     def __init__(self, name: str, pdf_bytes: bytes, force_ocr: bool):
         self.id = uuid.uuid4().hex
@@ -124,7 +159,8 @@ class Job:
             out.write_text(md, encoding="utf-8")
             self.result = {"file": out.name, "markdown": md}
         except Exception as e:
-            self.result = {"error": f"Klarte ikke å lese PDF-en: {e}"}
+            # Feilen oversettes i nettsiden; detaljen vises som den er
+            self.result = {"error": "read_failed", "detail": str(e)}
         self.pdf_bytes = b""
         self.finished = True
 
@@ -156,12 +192,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/":
-            page = PAGE.replace("{{OUT_DIR}}", str(OUT_DIR).replace(str(Path.home()), "~"))
+            page = (PAGE.replace("{{OUT_DIR}}", str(OUT_DIR).replace(str(Path.home()), "~"))
+                        .replace("{{LANG}}", ui_language()))
             self._send(200, page, "text/html; charset=utf-8")
         elif url.path == "/status":
             job = JOBS.get(parse_qs(url.query).get("id", [""])[0])
             if not job:
-                return self._send(404, json.dumps({"error": "Ukjent jobb"}))
+                return self._send(404, json.dumps({"error": "unknown_job", "finished": True}))
             status = job.status()
             if job.finished:
                 JOBS.pop(job.id, None)
@@ -174,6 +211,11 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/open-folder":
             OUT_DIR.mkdir(parents=True, exist_ok=True)
             subprocess.run(["open", str(OUT_DIR)])
+            return self._send(200, "{}")
+        if url.path == "/lang":
+            lang = self._body().decode()
+            if lang in ("nb", "en"):
+                save_setting("lang", lang)
             return self._send(200, "{}")
         if url.path == "/copy":
             # Utklippstavla via pbcopy virker både i nettleser og i app-vinduet
@@ -205,7 +247,11 @@ PAGE = r"""<!doctype html>
   * { box-sizing: border-box; }
   body { margin:0; font:15px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; background:var(--bg); color:var(--ink); }
   main { max-width: 900px; margin: 0 auto; padding: 32px 16px 64px; }
+  header { display:flex; justify-content:space-between; align-items:baseline; gap: 12px; }
   h1 { font-size: 22px; margin: 0 0 4px; }
+  .lang { display:flex; gap: 2px; font-size: 13px; }
+  .lang button { border: none; background: none; padding: 2px 6px; color: var(--muted); }
+  .lang button.on { color: var(--ink); font-weight: 600; }
   p.sub { color: var(--muted); margin: 0 0 20px; }
   #drop { border: 2px dashed var(--line); border-radius: 14px; background: var(--card); padding: 44px 16px; text-align: center; cursor: pointer; transition: .15s; }
   #drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--card)); }
@@ -231,20 +277,83 @@ PAGE = r"""<!doctype html>
 </head>
 <body>
 <main>
-  <h1>PDF til Markdown</h1>
-  <p class="sub">Alt skjer lokalt på maskinen. Skannede sider leses med tekstgjenkjenning (OCR). Ferdige filer lagres i {{OUT_DIR}}.</p>
+  <header>
+    <h1 data-i18n="title">PDF til Markdown</h1>
+    <div class="lang"><button data-lang="nb">Norsk</button><button data-lang="en">English</button></div>
+  </header>
+  <p class="sub" data-i18n="intro"></p>
   <div id="drop">
-    <strong>Slipp PDF-er her</strong>
-    <span>eller klikk for å velge filer</span>
+    <strong data-i18n="drop"></strong>
+    <span data-i18n="pick"></span>
     <input id="pick" type="file" accept="application/pdf,.pdf" multiple hidden>
   </div>
   <div class="bar">
-    <label><input type="checkbox" id="force"> Kjør OCR på alle sider (for PDF-er med dårlig tekstlag)</label>
-    <button id="folder">Åpne mappa</button>
+    <label><input type="checkbox" id="force"> <span data-i18n="force"></span></label>
+    <button id="folder" data-i18n="folder"></button>
   </div>
   <ul id="list"></ul>
 </main>
 <script>
+const OUT_DIR = '{{OUT_DIR}}';
+const TEXT = {
+  nb: {
+    title: 'PDF til Markdown',
+    intro: 'Alt skjer lokalt på maskinen. Skannede sider leses med tekstgjenkjenning (OCR). Ferdige filer lagres i {dir}.',
+    drop: 'Slipp PDF-er her', pick: 'eller klikk for å velge filer',
+    force: 'Kjør OCR på alle sider (for PDF-er med dårlig tekstlag)', folder: 'Åpne mappa',
+    queued: 'I kø', starting: 'Starter …', converting: 'Konverterer …',
+    convertingPages: 'Konverterer {n} sider …', convertingPage: 'Konverterer 1 side …',
+    progress: '{pct} % · side {done} av {pages}', saved: 'Lagret som {file}',
+    show: 'Vis', hide: 'Skjul', copy: 'Kopier', copied: 'Kopiert',
+    read_failed: 'Klarte ikke å lese PDF-en: {detail}', unknown_job: 'Konverteringen forsvant. Prøv igjen.',
+    failed: 'Noe gikk galt',
+  },
+  en: {
+    title: 'PDF to Markdown',
+    intro: 'Everything happens locally on your Mac. Scanned pages are read with text recognition (OCR). Converted files are saved in {dir}.',
+    drop: 'Drop PDFs here', pick: 'or click to choose files',
+    force: 'Run OCR on every page (for PDFs with a poor text layer)', folder: 'Open folder',
+    queued: 'Queued', starting: 'Starting …', converting: 'Converting …',
+    convertingPages: 'Converting {n} pages …', convertingPage: 'Converting 1 page …',
+    progress: '{pct}% · page {done} of {pages}', saved: 'Saved as {file}',
+    show: 'Show', hide: 'Hide', copy: 'Copy', copied: 'Copied',
+    read_failed: 'Could not read the PDF: {detail}', unknown_job: 'The conversion was lost. Please try again.',
+    failed: 'Something went wrong',
+  },
+};
+
+// Serveren bestemmer startspråket: eget valg (lagret i innstillingene) eller språket macOS står på
+let lang = TEXT['{{LANG}}'] ? '{{LANG}}' : 'en';
+
+function t(key, vars = {}) {
+  return (TEXT[lang][key] || key).replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? '');
+}
+
+// Elementer med data-i18n (og eventuelt data-vars) tegnes på nytt når språket byttes
+function setText(el, key, vars) {
+  el.dataset.i18n = key;
+  el.dataset.vars = JSON.stringify(vars || {});
+  el.textContent = t(key, vars);
+}
+
+function applyLang() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const vars = el.dataset.vars ? JSON.parse(el.dataset.vars) : {};
+    if (el.dataset.i18n === 'intro') vars.dir = OUT_DIR;
+    el.textContent = t(el.dataset.i18n, vars);
+  });
+  document.title = t('title');
+  document.querySelectorAll('.lang button').forEach(b => b.classList.toggle('on', b.dataset.lang === lang));
+}
+
+document.querySelectorAll('.lang button').forEach(b => b.onclick = () => {
+  lang = b.dataset.lang;
+  fetch('/lang', { method: 'POST', body: lang });
+  applyLang();
+});
+applyLang();
+
 const drop = document.getElementById('drop'), pick = document.getElementById('pick'), list = document.getElementById('list');
 drop.onclick = () => pick.click();
 pick.onchange = () => { handle(pick.files); pick.value = ''; };
@@ -262,8 +371,9 @@ function handle(files) {
   for (const f of files) {
     if (!f.name.toLowerCase().endsWith('.pdf')) continue;
     const li = document.createElement('li');
-    li.innerHTML = '<div class="row"><span class="name"></span><span class="status">I kø</span></div><div class="progress"><div class="fill"></div></div><pre></pre>';
+    li.innerHTML = '<div class="row"><span class="name"></span><span class="status"></span></div><div class="progress"><div class="fill"></div></div><pre></pre>';
     li.querySelector('.name').textContent = f.name;
+    setText(li.querySelector('.status'), 'queued');
     prev ? prev.after(li) : list.prepend(li);
     prev = li;
     const ocr = document.getElementById('force').checked ? '1' : '0';
@@ -275,7 +385,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function convert(f, li, ocr) {
   const status = li.querySelector('.status'), bar = li.querySelector('.progress'), fill = bar.querySelector('.fill');
-  status.textContent = 'Starter …';
+  setText(status, 'starting');
   bar.classList.add('busy');
   try {
     const res = await fetch('/convert?ocr=' + ocr + '&name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
@@ -290,27 +400,33 @@ async function convert(f, li, ocr) {
         const pct = Math.round(100 * data.done / data.pages);
         bar.classList.remove('busy');
         fill.style.width = pct + '%';
-        status.textContent = pct + ' % · side ' + data.done + ' av ' + data.pages;
+        setText(status, 'progress', { pct, done: data.done, pages: data.pages });
+      } else if (data.pages) {
+        setText(status, data.pages === 1 ? 'convertingPage' : 'convertingPages', { n: data.pages });
       } else {
-        status.textContent = data.pages ? 'Konverterer ' + data.pages + (data.pages === 1 ? ' side …' : ' sider …') : 'Konverterer …';
+        setText(status, 'converting');
       }
     }
-    if (data.error) throw new Error(data.error);
-    status.textContent = 'Lagret som ' + data.file;
+    if (data.error) {
+      setText(status, data.error, { detail: data.detail || '' });
+      status.className = 'status err';
+      return;
+    }
+    setText(status, 'saved', { file: data.file });
     status.className = 'status ok';
     li.querySelector('pre').textContent = data.markdown;
     const row = li.querySelector('.row');
-    const show = btn('Vis', () => { li.classList.toggle('open'); show.textContent = li.classList.contains('open') ? 'Skjul' : 'Vis'; });
-    const copy = btn('Kopier', async () => { await fetch('/copy', { method: 'POST', body: data.markdown }); copy.textContent = 'Kopiert'; setTimeout(() => copy.textContent = 'Kopier', 1500); });
+    const show = btn('show', () => { li.classList.toggle('open'); setText(show, li.classList.contains('open') ? 'hide' : 'show'); });
+    const copy = btn('copy', async () => { await fetch('/copy', { method: 'POST', body: data.markdown }); setText(copy, 'copied'); setTimeout(() => setText(copy, 'copy'), 1500); });
     row.append(show, copy);
   } catch (e) {
-    status.textContent = e.message || 'Noe gikk galt';
+    setText(status, 'failed');
     status.className = 'status err';
   } finally {
     bar.remove();
   }
 }
-function btn(label, fn) { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; return b; }
+function btn(key, fn) { const b = document.createElement('button'); setText(b, key); b.onclick = fn; return b; }
 </script>
 </body>
 </html>
