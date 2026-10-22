@@ -1,0 +1,3 @@
+# pymupdf4llm 2.0 på PyPI er en tom pakke – hold deg til 1.28.x
+pymupdf4llm==1.28.2
+pywebview==6.2.1

@@ -1,0 +1,13 @@
+# Konverterte filer når appen kjøres fra kildekoden
+Markdown/
+
+# Byggefiler hvis BUILD_ROOT settes inni prosjektet
+build/
+dist/
+tessdata/
+*.dmg
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
