@@ -39,7 +39,7 @@ OCR needs language data. Put `eng.traineddata` and `nor.traineddata` from [tessd
 ./build.sh
 ```
 
-The script creates its own Python environment, downloads language data, builds `PDF til Markdown.app` with PyInstaller and packages it in a `.dmg`. By default the build happens in `~/Library/Caches/pdf-til-markdown-build`, so the project folder doesn't fill up with hundreds of megabytes. Change this with `BUILD_ROOT`.
+The script creates its own Python environment, downloads language data, builds `PDF til Markdown.app` with PyInstaller and packages it in a `.dmg`. By default the build happens in `~/.cache/pdf-til-markdown-build`, so the project folder doesn't fill up with hundreds of megabytes. Change this with `BUILD_ROOT`.
 
 Without further setup the app is only ad hoc signed. It works on the Mac that built it, but others will get a Gatekeeper warning.
 

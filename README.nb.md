@@ -39,7 +39,7 @@ For OCR trenger du språkdata. Legg `nor.traineddata` og `eng.traineddata` fra [
 ./build.sh
 ```
 
-Skriptet lager et eget Python-miljø, laster ned språkdata, bygger `PDF til Markdown.app` med PyInstaller og pakker den i en `.dmg`. Byggingen skjer som standard i `~/Library/Caches/pdf-til-markdown-build`, slik at prosjektmappa ikke fylles med flere hundre MB. Det kan endres med `BUILD_ROOT`.
+Skriptet lager et eget Python-miljø, laster ned språkdata, bygger `PDF til Markdown.app` med PyInstaller og pakker den i en `.dmg`. Byggingen skjer som standard i `~/.cache/pdf-til-markdown-build`, slik at prosjektmappa ikke fylles med flere hundre MB. Det kan endres med `BUILD_ROOT`.
 
 Uten noe mer oppsett blir appen bare ad hoc-signert. Den virker da på maskinen der den ble bygget, men andre får en advarsel fra Gatekeeper.
 
