@@ -8,6 +8,8 @@ En liten Mac-app som gjør om PDF-er til Markdown. Dra filene inn i vinduet, så
 
 Konverteringen gjøres med [pymupdf4llm](https://github.com/pymupdf/pymupdf4llm), som kjenner igjen overskrifter, lister, fet og kursiv tekst og tabeller. Skannede sider uten tekstlag leses med tekstgjenkjenning (Tesseract-OCR) på norsk og engelsk. Har en PDF et tekstlag som gir rotete resultat, kan du krysse av for å kjøre OCR på alle sider. Hver fil får en fremdriftslinje med prosent og sidetall, og flere filer behandles i kø.
 
+Appen er laget for å takle store, bildetunge manualer. Skjermbilder blir ikke OCR-et når siden allerede har tekst, gjentatte topp- og bunntekster og kapittelfaner i margen fjernes, og prikkene i innholdsfortegnelser blir ikke til søppeltegn. Vil du ha med bildene, kan du krysse av for det. Da lagres de i en egen mappe ved siden av Markdown-fila, og teksten lenker til dem.
+
 Appen finnes på norsk og engelsk. Den følger språket macOS står på, og du kan bytte i øvre høyre hjørne.
 
 Appen krever en Mac med Apple Silicon og macOS 12 eller nyere.

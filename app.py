@@ -12,14 +12,16 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 APP_NAME = "PDF til Markdown"
 FROZEN = getattr(sys, "frozen", False)
@@ -89,21 +91,88 @@ def unique_path(stem: str) -> Path:
     return path
 
 
-def convert(pdf_bytes: bytes, force_ocr: bool = False, on_page=None) -> str:
-    # OCR kjøres automatisk på sider uten tekstlag; force_ocr tolker alle sider på nytt.
+# Sider med minst så mange tegn ekte tekst regnes som digitale og OCR-es ikke
+MIN_TEXT_CHARS = 50
+
+
+def make_ocr_function(force: bool):
+    """Standard-OCR-en i pymupdf4llm tolker også bilder på sider som allerede har tekst,
+    så skjermbilder i manualer blir til tegnsalat. Vi OCR-er bare sider uten tekstlag,
+    med mindre brukeren har bedt om OCR på alle sider."""
+    default = _layout.select_ocr_function()
+    if default is None:
+        return None
+
+    def ocr(page, **kwargs):
+        if not force:
+            text = page.get_text().replace("�", "").strip()
+            if len(text) >= MIN_TEXT_CHARS:
+                return
+        default(page, **kwargs)
+
+    return ocr
+
+
+def convert(pdf_bytes: bytes, force_ocr: bool = False, on_page=None, images_dir: Path = None) -> str:
     # on_page(ferdige, totalt) kalles per side for dokumenter på fem sider eller mer.
+    # images_dir: lagre bildene der og lenke til dem; ellers utelates bildene.
     _progress.report = on_page
+    # pymupdf4llm bytter ut mellomrom i hele lagringsstien til bildene, så de skrives
+    # først til en midlertidig mappe uten mellomrom og flyttes etterpå
+    tmp_images = Path(tempfile.mkdtemp(prefix="pdf2md_")) if images_dir else None
     try:
         with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
-            return pymupdf4llm.to_markdown(
+            md = pymupdf4llm.to_markdown(
                 doc,
                 show_progress=on_page is not None,
                 ocr_language="nor+eng",
                 ocr_dpi=300,
                 force_ocr=force_ocr,
+                ocr_function=make_ocr_function(force_ocr),
+                force_text=False,  # ikke ta med tekst som står inni bilder
+                header=False,  # sidetopptekst og -bunntekst gjentas på hver side
+                footer=False,
+                write_images=images_dir is not None,
+                image_path=str(tmp_images) if images_dir else "",
+                filename="bilde",  # bildene heter bilde-<side>-<nr>.png
             )
+        if images_dir:
+            images_dir.mkdir(parents=True, exist_ok=True)
+            for f in tmp_images.iterdir():
+                shutil.move(str(f), images_dir / f.name)
+            # Lenkene peker til den midlertidige mappa; gjør dem relative til .md-fila
+            md = re.sub(r"\]\([^)\n]*?/(bilde-[^)/\n]+)\)",
+                        lambda m: f"]({quote(images_dir.name)}/{m.group(1)})", md)
     finally:
         _progress.report = None
+        if tmp_images:
+            shutil.rmtree(tmp_images, ignore_errors=True)
+    return clean_markdown(md)
+
+
+def clean_markdown(md: str) -> str:
+    # Prikkene i innholdsfortegnelser og punkttegn fra symbolfonter blir til U+FFFD
+    md = re.sub(r"�{2,}", " … ", md)
+    md = re.sub(r"^(\s*)�\s*", r"\1- ", md, flags=re.M)
+    md = re.sub(r"(<br>)\s*�\s*", r"\1• ", md)
+    md = md.replace("�", "•")
+
+    # Korte linjer i store bokstaver som går igjen mange ganger (kapittelfaner i margen o.l.)
+    lines = md.split("\n")
+
+    def label(line):
+        text = re.sub(r"^#+\s*|\*+", "", line).strip()
+        return text if 0 < len(text) <= 25 and text.isupper() else None
+
+    counts = {}
+    for line in lines:
+        key = label(line)
+        if key:
+            counts[key] = counts.get(key, 0) + 1
+    lines = [line for line in lines if counts.get(label(line), 0) < 10]
+
+    md = "\n".join(line.rstrip() for line in lines)
+    return re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
 
 
 SETTINGS = Path.home() / "Library" / "Application Support" / APP_NAME / "settings.json"
@@ -141,10 +210,14 @@ def system_language() -> str:
     return "nb" if first in ("nb", "no", "nn") else "en"
 
 
+# Forhåndsvisningen i vinduet kuttes, så store manualer ikke gjør det tregt
+PREVIEW_CHARS = 200_000
+
+
 class Job:
-    def __init__(self, name: str, pdf_bytes: bytes, force_ocr: bool):
+    def __init__(self, name: str, pdf_bytes: bytes, force_ocr: bool, images: bool):
         self.id = uuid.uuid4().hex
-        self.name, self.pdf_bytes, self.force_ocr = name, pdf_bytes, force_ocr
+        self.name, self.pdf_bytes, self.force_ocr, self.images = name, pdf_bytes, force_ocr, images
         self.done, self.pages = 0, 0
         self.finished = False
         self.result = {}
@@ -153,11 +226,13 @@ class Job:
         try:
             with pymupdf.open(stream=self.pdf_bytes, filetype="pdf") as doc:
                 self.pages = doc.page_count
-            md = convert(self.pdf_bytes, self.force_ocr, self._on_page)
             OUT_DIR.mkdir(parents=True, exist_ok=True)
             out = unique_path(safe_stem(self.name))
+            images_dir = out.with_name(out.stem + " – bilder") if self.images else None
+            md = convert(self.pdf_bytes, self.force_ocr, self._on_page, images_dir)
             out.write_text(md, encoding="utf-8")
-            self.result = {"file": out.name, "markdown": md}
+            self.result = {"file": out.name, "markdown": md[:PREVIEW_CHARS],
+                           "truncated": len(md) > PREVIEW_CHARS}
         except Exception as e:
             # Feilen oversettes i nettsiden; detaljen vises som den er
             self.result = {"error": "read_failed", "detail": str(e)}
@@ -218,16 +293,21 @@ class Handler(BaseHTTPRequestHandler):
                 save_setting("lang", lang)
             return self._send(200, "{}")
         if url.path == "/copy":
-            # Utklippstavla via pbcopy virker både i nettleser og i app-vinduet
-            subprocess.run(["pbcopy"], input=self._body(), env={**os.environ, "LANG": "en_US.UTF-8"})
+            # Kopierer hele den lagrede fila (forhåndsvisningen kan være kuttet).
+            # pbcopy virker både i nettleser og i app-vinduet.
+            name = Path(unquote(parse_qs(url.query).get("file", [""])[0])).name
+            path = OUT_DIR / name
+            if name and path.is_file():
+                subprocess.run(["pbcopy"], input=path.read_bytes(), env={**os.environ, "LANG": "en_US.UTF-8"})
             return self._send(200, "{}")
         if url.path != "/convert":
             return self._send(404, "{}")
         query = parse_qs(url.query)
         name = unquote(query.get("name", ["dokument.pdf"])[0])
         force_ocr = query.get("ocr", ["0"])[0] == "1"
+        images = query.get("images", ["0"])[0] == "1"
         # Konverteringen går i bakgrunnen; nettsiden henter fremdrift fra /status
-        job = Job(name, self._body(), force_ocr)
+        job = Job(name, self._body(), force_ocr, images)
         JOBS[job.id] = job
         threading.Thread(target=job.run, daemon=True).start()
         self._send(200, json.dumps({"id": job.id}))
@@ -259,6 +339,9 @@ PAGE = r"""<!doctype html>
   #drop span { color: var(--muted); }
   .bar { display:flex; justify-content:space-between; align-items:center; gap: 12px; flex-wrap: wrap; margin: 12px 0 0; }
   .bar label { color: var(--muted); cursor: pointer; }
+  .opts { display:flex; flex-direction: column; gap: 4px; }
+  .note { color: var(--muted); font: 12px -apple-system, sans-serif; padding: 8px 14px; border-top: 1px solid var(--line); display:none; }
+  li.open .note.on { display:block; }
   button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 8px; padding: 5px 12px; cursor: pointer; }
   button:hover { border-color: var(--accent); }
   ul { list-style: none; padding: 0; margin: 20px 0 0; }
@@ -288,7 +371,10 @@ PAGE = r"""<!doctype html>
     <input id="pick" type="file" accept="application/pdf,.pdf" multiple hidden>
   </div>
   <div class="bar">
-    <label><input type="checkbox" id="force"> <span data-i18n="force"></span></label>
+    <div class="opts">
+      <label><input type="checkbox" id="force"> <span data-i18n="force"></span></label>
+      <label><input type="checkbox" id="images"> <span data-i18n="images"></span></label>
+    </div>
     <button id="folder" data-i18n="folder"></button>
   </div>
   <ul id="list"></ul>
@@ -301,6 +387,8 @@ const TEXT = {
     intro: 'Alt skjer lokalt på maskinen. Skannede sider leses med tekstgjenkjenning (OCR). Ferdige filer lagres i {dir}.',
     drop: 'Slipp PDF-er her', pick: 'eller klikk for å velge filer',
     force: 'Kjør OCR på alle sider (for PDF-er med dårlig tekstlag)', folder: 'Åpne mappa',
+    images: 'Ta med bilder (lagres i en egen mappe ved siden av)',
+    truncated: 'Forhåndsvisningen viser bare begynnelsen. Hele teksten ligger i fila, og «Kopier» tar med alt.',
     queued: 'I kø', starting: 'Starter …', converting: 'Konverterer …',
     convertingPages: 'Konverterer {n} sider …', convertingPage: 'Konverterer 1 side …',
     progress: '{pct} % · side {done} av {pages}', saved: 'Lagret som {file}',
@@ -313,6 +401,8 @@ const TEXT = {
     intro: 'Everything happens locally on your Mac. Scanned pages are read with text recognition (OCR). Converted files are saved in {dir}.',
     drop: 'Drop PDFs here', pick: 'or click to choose files',
     force: 'Run OCR on every page (for PDFs with a poor text layer)', folder: 'Open folder',
+    images: 'Include images (saved in a separate folder next to it)',
+    truncated: 'The preview only shows the beginning. The full text is in the file, and Copy includes all of it.',
     queued: 'Queued', starting: 'Starting …', converting: 'Converting …',
     convertingPages: 'Converting {n} pages …', convertingPage: 'Converting 1 page …',
     progress: '{pct}% · page {done} of {pages}', saved: 'Saved as {file}',
@@ -376,19 +466,20 @@ function handle(files) {
     setText(li.querySelector('.status'), 'queued');
     prev ? prev.after(li) : list.prepend(li);
     prev = li;
-    const ocr = document.getElementById('force').checked ? '1' : '0';
-    queue = queue.then(() => convert(f, li, ocr));
+    const opts = 'ocr=' + (document.getElementById('force').checked ? '1' : '0')
+               + '&images=' + (document.getElementById('images').checked ? '1' : '0');
+    queue = queue.then(() => convert(f, li, opts));
   }
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function convert(f, li, ocr) {
+async function convert(f, li, opts) {
   const status = li.querySelector('.status'), bar = li.querySelector('.progress'), fill = bar.querySelector('.fill');
   setText(status, 'starting');
   bar.classList.add('busy');
   try {
-    const res = await fetch('/convert?ocr=' + ocr + '&name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
+    const res = await fetch('/convert?' + opts + '&name=' + encodeURIComponent(f.name), { method: 'POST', body: f });
     const { id } = await res.json();
     let data;
     while (true) {
@@ -415,9 +506,15 @@ async function convert(f, li, ocr) {
     setText(status, 'saved', { file: data.file });
     status.className = 'status ok';
     li.querySelector('pre').textContent = data.markdown;
+    if (data.truncated) {
+      const note = document.createElement('div');
+      note.className = 'note on';
+      setText(note, 'truncated');
+      li.querySelector('pre').after(note);
+    }
     const row = li.querySelector('.row');
     const show = btn('show', () => { li.classList.toggle('open'); setText(show, li.classList.contains('open') ? 'hide' : 'show'); });
-    const copy = btn('copy', async () => { await fetch('/copy', { method: 'POST', body: data.markdown }); setText(copy, 'copied'); setTimeout(() => setText(copy, 'copy'), 1500); });
+    const copy = btn('copy', async () => { await fetch('/copy?file=' + encodeURIComponent(data.file), { method: 'POST' }); setText(copy, 'copied'); setTimeout(() => setText(copy, 'copy'), 1500); });
     row.append(show, copy);
   } catch (e) {
     setText(status, 'failed');
